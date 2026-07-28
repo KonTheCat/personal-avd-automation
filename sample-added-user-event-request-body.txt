@@ -1,0 +1,23 @@
+{
+  "value": [
+    {
+      "changeType": "updated",
+      "clientState": "REDACTED-CLIENT-STATE",
+      "resource": "Groups/REDACTED-GROUP-ID",
+      "resourceData": {
+        "@odata.type": "#Microsoft.Graph.Group",
+        "@odata.id": "Groups/REDACTED-GROUP-ID",
+        "id": "REDACTED-GROUP-ID",
+        "organizationId": "REDACTED-TENANT-ID",
+        "members@delta": [
+          {
+            "id": "REDACTED-USER-OBJECT-ID"
+          }
+        ]
+      },
+      "subscriptionExpirationDateTime": "2026-08-16T04:14:50-07:00",
+      "subscriptionId": "REDACTED-GRAPH-SUBSCRIPTION-ID",
+      "tenantId": "REDACTED-TENANT-ID"
+    }
+  ]
+}

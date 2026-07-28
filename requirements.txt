@@ -1,0 +1,9 @@
+azure-identity
+azure-mgmt-compute
+azure-mgmt-network
+azure-mgmt-desktopvirtualization
+python-dotenv
+requests
+azure-storage-blob
+azure-storage-queue
+azure-functions

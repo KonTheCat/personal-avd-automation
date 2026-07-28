@@ -1,0 +1,288 @@
+"""Core provisioning logic: given a UPN, produce one assigned AVD session host.
+
+This module has no dependency on any trigger framework (HTTP/queue/timer) —
+it's called directly by `local_cli.py` today, and will be called the same way
+from Azure Functions triggers once the group-membership-driven pipeline is
+built on top of it.
+
+NOTE ON SDK SURFACE: the exact method/field names used below for the
+azure-mgmt-desktopvirtualization client (`retrieve_registration_token`,
+`session_hosts.list`, the `resource_id`/`assigned_user` fields on the
+SessionHost model, `session_hosts.update`) reflect the shape of that SDK at
+time of writing but have shifted across package versions in the past. If any
+call here raises AttributeError/TypeError, check
+`python -c "import azure.mgmt.desktopvirtualization as m; help(m)"` (or the
+installed version's docs) against what's used here before assuming the logic
+is wrong.
+"""
+from __future__ import annotations
+
+import logging
+import time
+from datetime import datetime, timezone
+
+from . import naming
+from .azure_clients import AzureClients, build_clients
+from .config import Config
+from .state import AlreadyClaimedError, StateStore
+
+logger = logging.getLogger(__name__)
+
+AAD_LOGIN_EXTENSION_NAME = "AADLoginForWindows"
+
+
+def provision_session_host(
+    upn: str,
+    config: Config,
+    vm_size: str | None = None,
+    dry_run: bool = False,
+    user_key: str | None = None,
+) -> dict:
+    """Provision and assign one session host for `upn`.
+
+    `user_key` is the hostmap idempotency key (Section 3 of the plan) — the
+    Graph object id of the group member when called from the group-change
+    pipeline. Falls back to `upn` when called ad hoc (e.g. `local_cli.py
+    provision --upn`, where no Graph object id is available).
+    """
+    clients = build_clients(config)
+    size = vm_size or config.vm_size_default
+    key = user_key or upn
+
+    state_store = _build_state_store(config)
+
+    if state_store is not None:
+        existing_entry = state_store.get_hostmap_entry(key)
+        if existing_entry is not None and existing_entry.data.get("state") in ("provisioning", "assigned"):
+            logger.info(
+                "Hostmap entry for %s already exists (state=%s), skipping",
+                key, existing_entry.data.get("state"),
+            )
+            return {"status": f"already_{existing_entry.data.get('state')}", "hostmap": existing_entry.data}
+    else:
+        logger.warning(
+            "AVD_STATE_STORAGE_ACCOUNT_URL not set — falling back to a live AVD session-host "
+            "query for idempotency. This does not protect against two concurrent invocations "
+            "racing to provision the same user (see plan Section 5)."
+        )
+        existing = _find_existing_assignment(clients, config, upn)
+        if existing is not None:
+            logger.info("User %s already has a session host assigned: %s", upn, existing.name)
+            return {"status": "already_provisioned", "session_host": existing.name}
+
+    vm = naming.vm_name(upn, config.vm_name_prefix)
+    nic = naming.nic_name(upn, config.vm_name_prefix)
+    computer_name = naming.computer_name(upn)
+
+    # Fetched even in dry-run: a read-only ARM call, cheap insurance that
+    # catches a wrong VNet/subnet/resource-group *before* any real resource
+    # gets created, rather than failing partway through a live run.
+    subnet = clients.network.subnets.get(config.vnet_resource_group, config.vnet_name, config.subnet_name)
+
+    if dry_run:
+        logger.info(
+            "[dry-run] Would create NIC %s in %s (subnet id: %s)",
+            nic, config.subnet_name, subnet.id,
+        )
+        logger.info(
+            "[dry-run] Would create VM %s (size=%s, computer_name=%s, image=%s/%s/%s/%s)",
+            vm, size, computer_name,
+            config.image_publisher, config.image_offer, config.image_sku, config.image_version,
+        )
+        logger.info("[dry-run] Would deploy the %s extension for Entra ID join", AAD_LOGIN_EXTENSION_NAME)
+        logger.info("[dry-run] Would retrieve a fresh registration token and install the AVD agent + boot loader")
+        logger.info("[dry-run] Would poll for session host registration, then assign it to %s", upn)
+        return {
+            "status": "dry_run",
+            "vm_name": vm,
+            "nic_name": nic,
+            "computer_name": computer_name,
+            "vm_size": size,
+        }
+
+    if state_store is not None:
+        try:
+            state_store.claim_hostmap_entry(
+                key,
+                {"upn": upn, "state": "provisioning", "createdUtc": _utcnow_iso()},
+            )
+        except AlreadyClaimedError:
+            logger.info("Hostmap entry for %s was claimed by a concurrent run, skipping", key)
+            return {"status": "already_claimed"}
+
+    # NOTE ON BODY SHAPE: these azure-mgmt-network/azure-mgmt-compute versions pass a
+    # plain dict straight through to the wire (json.dumps with no key translation) —
+    # unlike the AVD SDK's msrest-style serializer, they do NOT convert snake_case to
+    # camelCase or auto-nest fields under "properties" for you. Every body below is
+    # written in the raw ARM REST shape (camelCase, explicit "properties" envelopes),
+    # verified against this SDK's model definitions rather than guessed.
+    logger.info("Creating NIC %s", nic)
+    nic_result = clients.network.network_interfaces.begin_create_or_update(
+        config.resource_group,
+        nic,
+        {
+            "location": config.location,
+            "properties": {
+                "ipConfigurations": [
+                    {"name": "ipconfig1", "properties": {"subnet": {"id": subnet.id}}}
+                ],
+            },
+            "tags": {"assignedUpn": upn, "createdBy": "avdprovisioning"},
+        },
+    ).result()
+
+    logger.info("Creating VM %s (size=%s)", vm, size)
+    vm_result = clients.compute.virtual_machines.begin_create_or_update(
+        config.resource_group,
+        vm,
+        {
+            "location": config.location,
+            # AADLoginForWindows (below) requires this to exist *before* it installs —
+            # without it, the extension reports ARM-level success but never actually
+            # completes the Entra ID device join, and the host fails DomainJoinedCheck.
+            "identity": {"type": "SystemAssigned"},
+            "properties": {
+                "hardwareProfile": {"vmSize": size},
+                "storageProfile": {
+                    "imageReference": {
+                        "publisher": config.image_publisher,
+                        "offer": config.image_offer,
+                        "sku": config.image_sku,
+                        "version": config.image_version,
+                    },
+                    "osDisk": {
+                        "createOption": "FromImage",
+                        "managedDisk": {"storageAccountType": config.os_disk_type},
+                    },
+                },
+                "osProfile": {
+                    "computerName": computer_name,
+                    "adminUsername": config.local_admin_username,
+                    "adminPassword": config.local_admin_password,
+                },
+                "networkProfile": {
+                    "networkInterfaces": [{"id": nic_result.id, "properties": {"primary": True}}]
+                },
+            },
+            "tags": {"assignedUpn": upn, "createdBy": "avdprovisioning"},
+        },
+    ).result()
+
+    logger.info("Deploying %s extension", AAD_LOGIN_EXTENSION_NAME)
+    clients.compute.virtual_machine_extensions.begin_create_or_update(
+        config.resource_group,
+        vm,
+        AAD_LOGIN_EXTENSION_NAME,
+        {
+            "location": config.location,
+            "properties": {
+                "publisher": "Microsoft.Azure.ActiveDirectory",
+                "type": "AADLoginForWindows",
+                "typeHandlerVersion": "2.0",
+                "autoUpgradeMinorVersion": True,
+            },
+        },
+    ).result()
+
+    logger.info("Retrieving a fresh host pool registration token")
+    registration_info = clients.avd.host_pools.retrieve_registration_token(
+        config.resource_group, config.host_pool_name
+    )
+
+    logger.info("Installing AVD agent + boot loader via Run Command")
+    clients.compute.virtual_machines.begin_run_command(
+        config.resource_group,
+        vm,
+        {
+            "commandId": "RunPowerShellScript",
+            "script": _agent_install_script(
+                config.agent_installer_url,
+                config.bootloader_installer_url,
+                registration_info.token,
+            ),
+        },
+    ).result()
+
+    logger.info(
+        "Waiting for %s to register as a session host (timeout=%ss)",
+        vm, config.registration_timeout_seconds,
+    )
+    session_host = _wait_for_registration(clients, config, vm_result.id)
+    session_host_name = session_host.name.split("/")[-1]
+
+    logger.info("Assigning %s to session host %s", upn, session_host_name)
+    clients.avd.session_hosts.update(
+        config.resource_group,
+        config.host_pool_name,
+        session_host_name,
+        session_host={"assigned_user": upn},
+    )
+
+    if state_store is not None:
+        state_store.update_hostmap_entry(
+            key,
+            {
+                "upn": upn,
+                "state": "assigned",
+                "vmName": vm,
+                "sessionHostResourceId": vm_result.id,
+                "assignedUtc": _utcnow_iso(),
+            },
+        )
+
+    logger.info("Done. %s is provisioned and assigned to %s", vm, upn)
+    return {
+        "status": "provisioned",
+        "vm_name": vm,
+        "session_host": session_host_name,
+        "assigned_user": upn,
+    }
+
+
+def _build_state_store(config: Config) -> StateStore | None:
+    if not config.state_storage_account_url:
+        return None
+    return StateStore(config.state_storage_account_url, config.state_container_name)
+
+
+def _utcnow_iso() -> str:
+    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.0Z")
+
+
+def _find_existing_assignment(clients: AzureClients, config: Config, upn: str):
+    hosts = clients.avd.session_hosts.list(config.resource_group, config.host_pool_name)
+    for host in hosts:
+        if (host.assigned_user or "").lower() == upn.lower():
+            return host
+    return None
+
+
+def _wait_for_registration(clients: AzureClients, config: Config, vm_resource_id: str):
+    deadline = time.monotonic() + config.registration_timeout_seconds
+    while True:
+        hosts = clients.avd.session_hosts.list(config.resource_group, config.host_pool_name)
+        for host in hosts:
+            if (host.resource_id or "").lower() == vm_resource_id.lower():
+                return host
+        if time.monotonic() >= deadline:
+            raise TimeoutError(
+                f"VM {vm_resource_id} did not register as a session host within "
+                f"{config.registration_timeout_seconds}s"
+            )
+        time.sleep(config.registration_poll_interval_seconds)
+
+
+def _agent_install_script(agent_url: str, bootloader_url: str, registration_token: str) -> list[str]:
+    escaped_token = registration_token.replace("'", "''")
+    return [
+        "$ErrorActionPreference = 'Stop'",
+        f"$agentUrl = '{agent_url}'",
+        f"$bootloaderUrl = '{bootloader_url}'",
+        f"$token = '{escaped_token}'",
+        "$agentMsi = Join-Path $env:TEMP 'AVDAgent.msi'",
+        "$bootloaderMsi = Join-Path $env:TEMP 'AVDBootloader.msi'",
+        "Invoke-WebRequest -Uri $agentUrl -OutFile $agentMsi -UseBasicParsing",
+        "Invoke-WebRequest -Uri $bootloaderUrl -OutFile $bootloaderMsi -UseBasicParsing",
+        "Start-Process msiexec.exe -ArgumentList @('/i', $agentMsi, '/quiet', '/qn', '/norestart', \"REGISTRATIONTOKEN=$token\", '/l*v', (Join-Path $env:TEMP 'AVDAgentInstall.log')) -Wait -NoNewWindow",
+        "Start-Process msiexec.exe -ArgumentList @('/i', $bootloaderMsi, '/quiet', '/qn', '/norestart', '/l*v', (Join-Path $env:TEMP 'AVDBootloaderInstall.log')) -Wait -NoNewWindow",
+    ]

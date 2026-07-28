@@ -1,0 +1,13 @@
+.git*
+.vscode
+__pycache__/
+*.pyc
+.venv/
+venv/
+.env
+.env.example
+local.settings.json
+local_cli.py
+avd-provisioning-function-plan.md
+sample-*-event-request-body.txt
+.github/
