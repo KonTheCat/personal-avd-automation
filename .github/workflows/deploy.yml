@@ -31,16 +31,24 @@ jobs:
       - name: Sanity-check the package compiles
         run: python -m py_compile function_app.py avdprovisioning/*.py
 
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Install Azure Functions Core Tools
+        run: npm install -g azure-functions-core-tools@4 --unsafe-perm true
+
       - uses: azure/login@v2
         with:
           client-id: ${{ secrets.AZURE_CLIENT_ID }}
           tenant-id: ${{ secrets.AZURE_TENANT_ID }}
           subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
 
+      # Azure/functions-action@v1 does a plain zip push that skips the remote
+      # (Oryx) build on this app's Flex Consumption plan, silently leaving
+      # requirements.txt uninstalled server-side (host then fails with
+      # ModuleNotFoundError). func core tools' `azure functionapp publish`
+      # is the one deployment path confirmed to trigger a real remote build
+      # here — it reuses the az CLI session azure/login just established.
       - name: Deploy to Azure Functions
-        uses: Azure/functions-action@v1
-        with:
-          app-name: ${{ env.AZURE_FUNCTIONAPP_NAME }}
-          package: "."
-          scm-do-build-during-deployment: true
-          enable-oryx-build: true
+        run: func azure functionapp publish ${{ env.AZURE_FUNCTIONAPP_NAME }} --python
