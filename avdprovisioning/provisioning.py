@@ -251,10 +251,14 @@ def _build_state_store(config: Config) -> StateStore | None:
     return StateStore(config.state_storage_account_url, config.state_container_name)
 
 
-# The API rejects an expirationTime outside [1 hour, 30 days] from now (confirmed
-# live) — registration_timeout_seconds defaults to 1800s (30 min), well under that
-# floor, so a freshly minted token's lifetime must be clamped up rather than just padded.
-MIN_TOKEN_LIFETIME_SECONDS = 3900  # 1h05m: comfortably clears the 1-hour API floor
+# The API rejects an expirationTime outside [1 hour, 30 days] from now (confirmed live).
+# A token is only ever invalidated by someone minting a new one (never by "extending" one
+# in place — every mint issues a genuinely new token string), so a later call's remint can
+# still yank a still-in-flight earlier call's token out from under it (see state.py's
+# registration_token_lock() docstring). The mitigation is to make reminting rare: 20 days
+# keeps the same token alive across any realistic provisioning cadence, so the reuse check
+# below almost never falls through to an actual remint in practice.
+DEFAULT_TOKEN_LIFETIME_SECONDS = 20 * 24 * 3600  # 20 days
 # Reuse an existing token only if it will outlive the full registration wait window
 # with margin — otherwise it could expire while _wait_for_registration is still polling.
 TOKEN_REUSE_SAFETY_MARGIN_SECONDS = 300
@@ -309,7 +313,7 @@ def _mint_registration_token(clients: AzureClients, config: Config):
     # the host pool's registrationInfo with registrationTokenOperation="Update" (confirmed
     # against the live ARM API: retrieve_registration_token alone returned token=None).
     logger.info("Generating a fresh host pool registration token")
-    token_lifetime = max(config.registration_timeout_seconds + 900, MIN_TOKEN_LIFETIME_SECONDS)
+    token_lifetime = max(config.registration_timeout_seconds + 900, DEFAULT_TOKEN_LIFETIME_SECONDS)
     token_expiration = datetime.now(timezone.utc) + timedelta(seconds=token_lifetime)
     host_pool = clients.avd.host_pools.update(
         config.resource_group,
