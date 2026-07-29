@@ -17,10 +17,16 @@ from __future__ import annotations
 
 import json
 import logging
+import time
 from dataclasses import dataclass
 
 from azure.core import MatchConditions
-from azure.core.exceptions import ResourceExistsError, ResourceModifiedError, ResourceNotFoundError
+from azure.core.exceptions import (
+    HttpResponseError,
+    ResourceExistsError,
+    ResourceModifiedError,
+    ResourceNotFoundError,
+)
 from azure.identity import DefaultAzureCredential
 from azure.storage.blob import BlobServiceClient
 
@@ -28,6 +34,8 @@ logger = logging.getLogger(__name__)
 
 SUBSCRIPTION_BLOB_NAME = "subscription.json"
 HOSTMAP_BLOB_PREFIX = "hostmap/"
+REGISTRATION_LOCK_BLOB_NAME = "registration-token.lock"
+REGISTRATION_TOKEN_BLOB_NAME = "registration-token.json"
 
 __all__ = [
     "BlobRecord",
@@ -66,6 +74,22 @@ class StateStore:
     def get_hostmap_entry(self, user_key: str) -> BlobRecord | None:
         return self._get_json(_hostmap_blob_name(user_key))
 
+    def get_registration_token(self) -> BlobRecord | None:
+        """Our own cached record of the last-minted AVD registration token.
+
+        CONFIRMED LIVE (2026-07-29): the AVD host pool's `registrationInfo`
+        comes back null on a plain GET of the host pool even seconds after a
+        token was minted — the token value is only ever exposed in the mint
+        (PATCH) response itself. There is no way to ask ARM "is there still a
+        valid token", so this cache is the only way to avoid re-minting (and
+        thereby invalidating an in-flight VM's already-embedded token) on
+        every single provisioning call.
+        """
+        return self._get_json(REGISTRATION_TOKEN_BLOB_NAME)
+
+    def save_registration_token(self, data: dict, etag: str | None = None) -> None:
+        self._put_json(REGISTRATION_TOKEN_BLOB_NAME, data, etag=etag)
+
     def claim_hostmap_entry(self, user_key: str, data: dict) -> None:
         """Atomically create the hostmap entry if it doesn't exist yet.
 
@@ -81,6 +105,20 @@ class StateStore:
 
     def update_hostmap_entry(self, user_key: str, data: dict, etag: str | None = None) -> None:
         self._put_json(_hostmap_blob_name(user_key), data, etag=etag)
+
+    def registration_token_lock(self, lease_seconds: int = 30, acquire_timeout_seconds: float = 30) -> "_BlobLock":
+        """Mutual-exclusion lock guarding the AVD host pool's registration-token mint.
+
+        The host pool has exactly one active registration token at a time.
+        CONFIRMED LIVE (2026-07-29): two provisioning runs that each decided
+        "no valid token, mint one" 0.55s apart silently invalidated each
+        other's already-embedded token, leaving one VM's agent stuck
+        registering with a token that had already been overwritten. Callers
+        must hold this lock around the check-existing/mint-if-needed
+        decision (not around the whole provisioning flow — reading an
+        already-valid token is safe for any number of concurrent callers).
+        """
+        return _BlobLock(self._container, REGISTRATION_LOCK_BLOB_NAME, lease_seconds, acquire_timeout_seconds)
 
     def _get_json(self, blob_name: str) -> BlobRecord | None:
         blob_client = self._container.get_blob_client(blob_name)
@@ -107,3 +145,39 @@ class StateStore:
 
 def _hostmap_blob_name(user_key: str) -> str:
     return f"{HOSTMAP_BLOB_PREFIX}{user_key}.json"
+
+
+class _BlobLock:
+    """Context manager wrapping an Azure Blob lease as a short-lived mutex."""
+
+    def __init__(self, container, blob_name: str, lease_seconds: int, acquire_timeout_seconds: float):
+        self._blob_client = container.get_blob_client(blob_name)
+        self._lease_seconds = lease_seconds
+        self._acquire_timeout_seconds = acquire_timeout_seconds
+        self._lease = None
+
+    def __enter__(self) -> "_BlobLock":
+        try:
+            self._blob_client.upload_blob(b"", overwrite=False)
+        except ResourceExistsError:
+            pass
+        except HttpResponseError as exc:
+            # If the blob already exists AND is currently leased by another
+            # holder, Azure returns LeaseIdMissing here instead of the plain
+            # "already exists" conflict (confirmed live) — that still means
+            # the blob is present, which is all this step needs; the lease
+            # acquisition below is what actually enforces mutual exclusion.
+            if exc.error_code != "LeaseIdMissing":
+                raise
+        deadline = time.monotonic() + self._acquire_timeout_seconds
+        while True:
+            try:
+                self._lease = self._blob_client.acquire_lease(lease_duration=self._lease_seconds)
+                return self
+            except HttpResponseError:
+                if time.monotonic() >= deadline:
+                    raise
+                time.sleep(1)
+
+    def __exit__(self, *exc_info) -> None:
+        self._lease.release()
