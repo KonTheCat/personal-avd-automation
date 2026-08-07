@@ -74,6 +74,8 @@ Both behaviors (claim-rejects-duplicate, update-rejects-stale-etag) were verifie
 
 **Identity:** whoever calls this (your `az login` locally, the Function App's managed identity in production) needs the **Storage Blob Data Contributor** role on the storage account — this is a data-plane RBAC role, separate from and not implied by control-plane roles like Owner/Contributor on the account itself.
 
+**Built and live-tested (2026-08-06):** the `registration-token.json` blob (the cached AVD host pool registration token — see Section 5 step 4) moved out of this container into Key Vault; `registration-token.lock` stays here — it's a lease-based mutex, unrelated to where the token *value* is stored. See Section 7.
+
 ## 4. Function 1 — `notification_listener` (HTTP trigger)
 
 **Built and deployed (2026-07-27):** `function_app.py`, route `/api/notifications`, anonymous auth (Graph's webhook POST carries no auth header — `clientState` is the authenticity check, not a function key).
@@ -121,11 +123,12 @@ Both behaviors (claim-rejects-duplicate, update-rejects-stale-etag) were verifie
 
 ## 7. Identity & permissions this Function App needs
 
-**Built and granted (2026-07-27).** Simpler than originally sketched: since app-only Graph access via managed identity works fine for the subscriptions/user-lookup calls this pipeline actually makes (no delta-query edge cases to worry about post-Section-2), there's a single identity for everything — no separate app registration, no client secret, no Key Vault.
+**Built and granted (2026-07-27).** Simpler than originally sketched: since app-only Graph access via managed identity works fine for the subscriptions/user-lookup calls this pipeline actually makes (no delta-query edge cases to worry about post-Section-2), there's a single identity for everything — no separate app registration, no client secret. **Key Vault added (2026-08-06):** `avdperuserkv` (same RG, RBAC-authorized, no purge protection) caches the AVD host pool registration token as a secret (`avdprovisioning/token_vault.py`) — see below.
 
 **Azure RBAC**, system-assigned managed identity (principal id `REDACTED-PRINCIPAL-ID`) granted on:
 - `avd` resource group: Virtual Machine Contributor, Network Contributor, Desktop Virtualization Host Pool Contributor
 - `avdperuserstate` storage account: Storage Blob Data Contributor
+- `avdperuserkv` Key Vault: Key Vault Secrets Officer (needs both read and write — the app mints and caches new tokens, not just reads them)
 
 **Microsoft Graph application permissions**, granted directly to the same managed identity's service principal via `appRoleAssignedTo` (no separate admin-consent step needed — programmatic app role assignment takes effect immediately):
 - `GroupMember.Read.All` — resolve the group by name, create/manage the change-notification subscription
@@ -143,6 +146,7 @@ azure-mgmt-network
 azure-mgmt-desktopvirtualization
 azure-storage-blob     # state.py — subscription + hostmap records (Section 3)
 azure-storage-queue
+azure-keyvault-secrets  # token_vault.py — registration-token cache (Section 3/7)
 requests                # graph_client.py — plain REST against Graph, no msgraph-sdk abstraction
 ```
 
@@ -219,7 +223,7 @@ The Function App only ever calls **management-plane APIs** (ARM, Graph) — it d
 - **Python 3.14 + remote build prints a scary-looking warning** ("Remote build for Python 3.14 is not yet supported for Flex") but the build completed and installed `requirements.txt` correctly regardless — don't take that warning as a hard failure without checking `/admin/host/status` first.
 - **Python v2 programming model queue output binding gotcha:** annotate the parameter as `func.Out[str]` (singular), not `func.Out[list[str]]` — the latter throws `FunctionLoadError: ... invalid non-type annotation` at host startup on the Python 3.14 worker. Sending multiple queue messages from one invocation is still done by calling `.set([...])` with a list at runtime; the annotation itself must stay singular.
 
-**Identity/permissions:** see Section 7 — system-assigned managed identity, no separate app registration, no Key Vault.
+**Identity/permissions:** see Section 7 — system-assigned managed identity, no separate app registration, Key Vault added 2026-08-06 for the registration-token cache.
 
 **CI/CD:** `.github/workflows/deploy.yml` — triggers on push to `main` touching `avdprovisioning/**`, `function_app.py`, `host.json`, or `requirements.txt` (plus manual `workflow_dispatch`). Authenticates to Azure via **OIDC** (`azure/login@v2`, no stored client secret): a dedicated app registration (`github-deploy-ktk-avd-per-user-automation`, app id `REDACTED-CLIENT-ID`) has a federated credential trusting `repo:KonTheCat/personal-avd-automation:ref:refs/heads/main`, and its service principal holds **Website Contributor** scoped only to this one Function App resource (not the whole RG) — enough to deploy code, nothing else.
 

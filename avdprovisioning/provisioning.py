@@ -34,6 +34,7 @@ from . import naming
 from .azure_clients import AzureClients, build_clients
 from .config import Config
 from .state import AlreadyClaimedError, StateStore
+from .token_vault import RegistrationTokenVault
 
 logger = logging.getLogger(__name__)
 
@@ -59,6 +60,7 @@ def provision_session_host(
     key = user_key or upn
 
     state_store = _build_state_store(config)
+    token_vault = _build_token_vault(config)
 
     if state_store is not None:
         existing_entry = state_store.get_hostmap_entry(key)
@@ -193,7 +195,7 @@ def provision_session_host(
         },
     ).result()
 
-    registration_info = _get_registration_info(clients, config, state_store)
+    registration_info = _get_registration_info(clients, config, state_store, token_vault)
 
     logger.info("Installing AVD agent + boot loader via Run Command")
     clients.compute.virtual_machines.begin_run_command(
@@ -251,6 +253,12 @@ def _build_state_store(config: Config) -> StateStore | None:
     return StateStore(config.state_storage_account_url, config.state_container_name)
 
 
+def _build_token_vault(config: Config) -> RegistrationTokenVault | None:
+    if not config.keyvault_url:
+        return None
+    return RegistrationTokenVault(config.keyvault_url)
+
+
 # The API rejects an expirationTime outside [1 hour, 30 days] from now (confirmed live).
 # A token is only ever invalidated by someone minting a new one (never by "extending" one
 # in place — every mint issues a genuinely new token string), so a later call's remint can
@@ -264,18 +272,27 @@ DEFAULT_TOKEN_LIFETIME_SECONDS = 20 * 24 * 3600  # 20 days
 TOKEN_REUSE_SAFETY_MARGIN_SECONDS = 300
 
 
-def _get_registration_info(clients: AzureClients, config: Config, state_store: StateStore | None):
-    if state_store is None:
-        # No cache available to check for a still-valid token (see NOTE below) and no
-        # lock to serialize against concurrent callers — this fallback path still races
-        # exactly like the pre-fix code did, same tradeoff already accepted elsewhere in
-        # this function for the no-state-store case (see _find_existing_assignment).
+def _get_registration_info(
+    clients: AzureClients, config: Config, state_store: StateStore | None, token_vault: RegistrationTokenVault | None
+):
+    if state_store is None or token_vault is None:
+        # Caching needs both: the lock lives in state_store, the cached value lives in
+        # token_vault. Partial config (only one of the two set) can't safely combine —
+        # a lock with nothing to check inside it buys nothing — so treat it the same as
+        # neither being configured: no cache, no lock, same accepted race as the
+        # pre-Key-Vault no-state-store fallback (see _find_existing_assignment).
+        if state_store is None and token_vault is None:
+            logger.warning("Neither AVD_STATE_STORAGE_ACCOUNT_URL nor AVD_KEYVAULT_URL set — minting unconditionally")
+        elif state_store is None:
+            logger.warning("AVD_STATE_STORAGE_ACCOUNT_URL not set — minting unconditionally despite AVD_KEYVAULT_URL")
+        else:
+            logger.warning("AVD_KEYVAULT_URL not set — minting unconditionally despite AVD_STATE_STORAGE_ACCOUNT_URL")
         return _mint_registration_token(clients, config)
     with state_store.registration_token_lock():
-        return _mint_or_reuse_registration_token(clients, config, state_store)
+        return _mint_or_reuse_registration_token(clients, config, token_vault)
 
 
-def _mint_or_reuse_registration_token(clients: AzureClients, config: Config, state_store: StateStore):
+def _mint_or_reuse_registration_token(clients: AzureClients, config: Config, token_vault: RegistrationTokenVault):
     # NOTE: the AVD host pool's registrationInfo comes back null on a plain GET even
     # seconds after a token was minted (confirmed live) — ARM only ever exposes the
     # token value in the mint (PATCH) response itself. So "is there still a valid
@@ -285,12 +302,10 @@ def _mint_or_reuse_registration_token(clients: AzureClients, config: Config, sta
     min_required_expiration = now + timedelta(
         seconds=config.registration_timeout_seconds + TOKEN_REUSE_SAFETY_MARGIN_SECONDS
     )
-    cached = state_store.get_registration_token()
-    if cached is not None and cached.data.get("token"):
-        cached_expiration = datetime.fromisoformat(cached.data["expirationTime"])
-        if cached_expiration > min_required_expiration:
-            logger.info("Reusing cached host pool registration token (valid until %s)", cached_expiration)
-            return SimpleNamespace(token=cached.data["token"], expiration_time=cached_expiration)
+    cached = token_vault.get_registration_token()
+    if cached is not None and cached.expiration_time > min_required_expiration:
+        logger.info("Reusing cached host pool registration token (valid until %s)", cached.expiration_time)
+        return SimpleNamespace(token=cached.token, expiration_time=cached.expiration_time)
 
     # CONFIRMED LIVE (2026-07-29): minting a token unconditionally on every call let two
     # concurrent provisioning runs invalidate each other's already-embedded token 0.55s
@@ -300,9 +315,7 @@ def _mint_or_reuse_registration_token(clients: AzureClients, config: Config, sta
     # registration_token_lock() (held by the caller) serializes the mint itself so two
     # callers can't decide "no valid token" at the same moment and both mint.
     registration_info = _mint_registration_token(clients, config)
-    state_store.save_registration_token(
-        {"token": registration_info.token, "expirationTime": registration_info.expiration_time.isoformat()}
-    )
+    token_vault.save_registration_token(registration_info.token, registration_info.expiration_time)
     return registration_info
 
 

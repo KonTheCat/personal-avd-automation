@@ -59,6 +59,7 @@ class Config:
     notification_listener_url: str | None
     state_storage_account_url: str | None
     state_container_name: str
+    keyvault_url: str | None
 
 
 def load_config() -> Config:
@@ -100,4 +101,5 @@ def load_config() -> Config:
         notification_listener_url=os.environ.get("AVD_NOTIFICATION_LISTENER_URL") or None,
         state_storage_account_url=os.environ.get("AVD_STATE_STORAGE_ACCOUNT_URL") or None,
         state_container_name=os.environ.get("AVD_STATE_CONTAINER_NAME", "state"),
+        keyvault_url=os.environ.get("AVD_KEYVAULT_URL") or None,
     )

@@ -1,8 +1,13 @@
-"""Blob-backed state store: the subscription singleton and the hostmap idempotency guard.
+"""Blob-backed state store: the subscription singleton, the hostmap idempotency
+guard, and the registration-token mutual-exclusion lock.
 
-One container, two kinds of blobs (Section 3 of the plan):
+One container, a few kinds of blobs (Section 3 of the plan):
   - "subscription.json"              the current Graph subscription (id, expiration, clientState, notificationUrl)
   - "hostmap/<user-object-id>.json"  one blob per user (vmName, sessionHostResourceId, state, createdUtc)
+  - "registration-token.lock"        empty blob used only as a lease target — see
+                                      registration_token_lock() below. The registration
+                                      token's actual value+expiration lives in Key Vault
+                                      (avdprovisioning/token_vault.py), not here.
 
 Blob ETags give the same guarantees Table Storage rows would:
   - claim_hostmap_entry() uploads with overwrite=False, which 409s
@@ -35,7 +40,6 @@ logger = logging.getLogger(__name__)
 SUBSCRIPTION_BLOB_NAME = "subscription.json"
 HOSTMAP_BLOB_PREFIX = "hostmap/"
 REGISTRATION_LOCK_BLOB_NAME = "registration-token.lock"
-REGISTRATION_TOKEN_BLOB_NAME = "registration-token.json"
 
 __all__ = [
     "BlobRecord",
@@ -73,22 +77,6 @@ class StateStore:
 
     def get_hostmap_entry(self, user_key: str) -> BlobRecord | None:
         return self._get_json(_hostmap_blob_name(user_key))
-
-    def get_registration_token(self) -> BlobRecord | None:
-        """Our own cached record of the last-minted AVD registration token.
-
-        CONFIRMED LIVE (2026-07-29): the AVD host pool's `registrationInfo`
-        comes back null on a plain GET of the host pool even seconds after a
-        token was minted — the token value is only ever exposed in the mint
-        (PATCH) response itself. There is no way to ask ARM "is there still a
-        valid token", so this cache is the only way to avoid re-minting (and
-        thereby invalidating an in-flight VM's already-embedded token) on
-        every single provisioning call.
-        """
-        return self._get_json(REGISTRATION_TOKEN_BLOB_NAME)
-
-    def save_registration_token(self, data: dict, etag: str | None = None) -> None:
-        self._put_json(REGISTRATION_TOKEN_BLOB_NAME, data, etag=etag)
 
     def claim_hostmap_entry(self, user_key: str, data: dict) -> None:
         """Atomically create the hostmap entry if it doesn't exist yet.
