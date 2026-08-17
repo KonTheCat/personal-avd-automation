@@ -2,23 +2,23 @@
   "value": [
     {
       "changeType": "updated",
-      "clientState": "REDACTED-CLIENT-STATE",
-      "resource": "Groups/REDACTED-GROUP-ID",
+      "clientState": "example-client-state-value-do-not-use",
+      "resource": "Groups/bbbbbbbb-0000-0000-0000-000000000002",
       "resourceData": {
         "@odata.type": "#Microsoft.Graph.Group",
-        "@odata.id": "Groups/REDACTED-GROUP-ID",
-        "id": "REDACTED-GROUP-ID",
-        "organizationId": "REDACTED-TENANT-ID",
+        "@odata.id": "Groups/bbbbbbbb-0000-0000-0000-000000000002",
+        "id": "bbbbbbbb-0000-0000-0000-000000000002",
+        "organizationId": "aaaaaaaa-0000-0000-0000-000000000001",
         "members@delta": [
           {
-            "id": "REDACTED-USER-OBJECT-ID",
+            "id": "cccccccc-0000-0000-0000-000000000003",
             "@removed": "deleted"
           }
         ]
       },
       "subscriptionExpirationDateTime": "2026-08-16T04:14:50-07:00",
-      "subscriptionId": "REDACTED-GRAPH-SUBSCRIPTION-ID",
-      "tenantId": "REDACTED-TENANT-ID"
+      "subscriptionId": "dddddddd-0000-0000-0000-000000000004",
+      "tenantId": "aaaaaaaa-0000-0000-0000-000000000001"
     }
   ]
 }

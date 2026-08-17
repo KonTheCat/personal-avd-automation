@@ -2,7 +2,7 @@
 
 This is the step-by-step setup runbook: what to provision, what identity to create, and exactly which permissions to grant it, in order. For *why* the system is built the way it is (architecture rationale, superseded designs, live-test history), see [avd-provisioning-function-plan.md](avd-provisioning-function-plan.md) — this guide is the reproducible checklist version of that document, with the RBAC question nailed down explicitly.
 
-Current live deployment (for reference, values will differ in a new tenant/subscription): Function App `ktk-avd-per-user-automation`, resource group `avd-per-user-automation`, managed identity principal id `REDACTED-PRINCIPAL-ID`.
+Current live deployment (for reference, values will differ in a new tenant/subscription): Function App `ktk-avd-per-user-automation`, resource group `avd-per-user-automation`, managed identity principal id `<object id of the Function App's system-assigned identity>`.
 
 ## 1. What this system does
 

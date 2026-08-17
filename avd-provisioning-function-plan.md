@@ -137,7 +137,7 @@ Both behaviors (claim-rejects-duplicate, update-rejects-stale-etag) were verifie
 
 **Built and granted (2026-07-27).** Simpler than originally sketched: since app-only Graph access via managed identity works fine for the subscriptions/user-lookup calls this pipeline actually makes (no delta-query edge cases to worry about post-Section-2), there's a single identity for everything — no separate app registration, no client secret. **Key Vault added (2026-08-06):** `avdperuserkv` (same RG, RBAC-authorized, no purge protection) caches the AVD host pool registration token as a secret (`avdprovisioning/token_vault.py`) — see below.
 
-**Azure RBAC**, system-assigned managed identity (principal id `REDACTED-PRINCIPAL-ID`) granted on:
+**Azure RBAC**, system-assigned managed identity (principal id `<object id of the Function App's system-assigned identity>`) granted on:
 - `avd` resource group: Virtual Machine Contributor, Network Contributor, Desktop Virtualization Host Pool Contributor
 - `avdperuserstate` storage account: Storage Blob Data Contributor
 - `avdperuserkv` Key Vault: Key Vault Secrets Officer (needs both read and write — the app mints and caches new tokens, not just reads them)
@@ -237,16 +237,16 @@ The Function App only ever calls **management-plane APIs** (ARM, Graph) — it d
 
 **Identity/permissions:** see Section 7 — system-assigned managed identity, no separate app registration, Key Vault added 2026-08-06 for the registration-token cache.
 
-**CI/CD:** `.github/workflows/deploy.yml` — triggers on push to `main` touching `avdprovisioning/**`, `function_app.py`, `host.json`, or `requirements.txt` (plus manual `workflow_dispatch`). Authenticates to Azure via **OIDC** (`azure/login@v2`, no stored client secret): a dedicated app registration (`github-deploy-ktk-avd-per-user-automation`, app id `REDACTED-CLIENT-ID`) has a federated credential trusting `repo:KonTheCat/personal-avd-automation:ref:refs/heads/main`, and its service principal holds **Website Contributor** scoped only to this one Function App resource (not the whole RG) — enough to deploy code, nothing else.
+**CI/CD:** `.github/workflows/deploy.yml` — triggers on push to `main` touching `avdprovisioning/**`, `function_app.py`, `host.json`, or `requirements.txt` (plus manual `workflow_dispatch`). Authenticates to Azure via **OIDC** (`azure/login@v2`, no stored client secret): a dedicated app registration (`github-deploy-ktk-avd-per-user-automation`, app id `<app registration's client id>`) has a federated credential trusting `repo:<owner>/<repo>:ref:refs/heads/main`, and its service principal holds **Website Contributor** scoped only to this one Function App resource (not the whole RG) — enough to deploy code, nothing else.
 
 Two gotchas hit and fixed after the initial build:
 - **Federated credential subject format:** if the GitHub org/repo has ever been renamed, GitHub's OIDC token embeds immutable numeric IDs in the `sub` claim (`repo:OWNER@ownerId/REPO@repoId:ref:...`) instead of the plain-name form — `az login` fails with `AADSTS700213` until the federated credential's `subject` is updated to match exactly what the token presents (check the error message; it states the subject GitHub actually sent).
 - **Deploy step must use Azure Functions Core Tools, not `Azure/functions-action@v1`:** the latter's zip push skips the remote (Oryx) build on this app's Flex Consumption plan — the deploy reports success but `requirements.txt` never gets installed server-side, and the host crashes on first import with `ModuleNotFoundError`. The workflow installs `azure-functions-core-tools@4` via npm and runs `func azure functionapp publish <app> --python`, reusing the `az login` session `azure/login@v2` already established — this is the one path confirmed (via manual testing, Section 13 above) to trigger a real remote build.
 
 **GitHub repo secrets required** (not yet set — `gh` CLI wasn't available in this environment to set them programmatically; add these in the repo's Settings → Secrets and variables → Actions):
-- `AZURE_CLIENT_ID` = `REDACTED-CLIENT-ID`
-- `AZURE_TENANT_ID` = `REDACTED-TENANT-ID`
-- `AZURE_SUBSCRIPTION_ID` = `REDACTED-AZURE-SUBSCRIPTION-ID`
+- `AZURE_CLIENT_ID` = the app registration's application (client) id
+- `AZURE_TENANT_ID` = your Entra ID tenant id
+- `AZURE_SUBSCRIPTION_ID` = the Azure subscription id the Function App lives in
 
 None of these are secret-*material* in the OIDC sense (no client secret exists at all) but they're conventionally stored as Actions secrets alongside `azure/login` examples.
 
