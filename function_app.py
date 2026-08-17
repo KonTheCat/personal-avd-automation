@@ -10,7 +10,7 @@ import logging
 import azure.functions as func
 
 from avdprovisioning.config import load_config
-from avdprovisioning.graph_notifications import extract_member_changes, resolve_user_upn
+from avdprovisioning.graph_notifications import extract_member_changes, resolve_user_identity
 from avdprovisioning.provisioning import deallocate_session_host, provision_session_host
 from avdprovisioning.state import StateStore
 from avdprovisioning.subscriptions import renew_or_recreate_subscription
@@ -80,13 +80,19 @@ def group_change_processor(msg: func.QueueMessage) -> None:
         logger.info("deallocate_session_host(%s) -> %s", member_id, result)
         return
 
-    upn = resolve_user_upn(member_id)
-    if upn is None:
+    identity = resolve_user_identity(member_id)
+    if identity is None:
         logger.info("Member %s is not a user object, skipping", member_id)
         return
 
-    result = provision_session_host(upn=upn, config=config, user_key=member_id)
-    logger.info("provision_session_host(%s) -> %s", upn, result)
+    result = provision_session_host(
+        upn=identity.upn,
+        config=config,
+        user_key=member_id,
+        given_name=identity.given_name,
+        surname=identity.surname,
+    )
+    logger.info("provision_session_host(%s) -> %s", identity.upn, result)
 
 
 @app.function_name(name="subscription_renewer")

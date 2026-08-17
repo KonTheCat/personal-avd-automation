@@ -45,11 +45,24 @@ def extract_member_changes(notification_body: dict, expected_client_state: str |
     return changes
 
 
-def resolve_user_upn(member_id: str) -> str | None:
-    """Resolve a member object id to a UPN. Returns None if it isn't a user
-    (e.g. a nested group or service principal was added to the group)."""
-    resp = graph_client.get(f"/users/{member_id}", params={"$select": "userPrincipalName"})
+@dataclass(frozen=True)
+class UserIdentity:
+    upn: str
+    given_name: str | None
+    surname: str | None
+
+
+def resolve_user_identity(user_id_or_upn: str) -> UserIdentity | None:
+    """Resolve a member object id (or a UPN directly — Graph's /users/{key}
+    accepts either) to the fields provisioning needs: the UPN, plus
+    givenName/surname used to build the Windows computer name (naming.py).
+    Returns None if it isn't a user (e.g. a nested group or service principal
+    was added to the group, or an ad-hoc UPN doesn't exist in the tenant)."""
+    resp = graph_client.get(
+        f"/users/{user_id_or_upn}", params={"$select": "userPrincipalName,givenName,surname"}
+    )
     if resp.status_code == 404:
         return None
     resp.raise_for_status()
-    return resp.json()["userPrincipalName"]
+    data = resp.json()
+    return UserIdentity(upn=data["userPrincipalName"], given_name=data.get("givenName"), surname=data.get("surname"))

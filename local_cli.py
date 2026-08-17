@@ -23,7 +23,7 @@ import logging
 import sys
 
 from avdprovisioning.config import Config, load_config
-from avdprovisioning.graph_notifications import extract_member_changes, resolve_user_upn
+from avdprovisioning.graph_notifications import extract_member_changes, resolve_user_identity
 from avdprovisioning.graph_subscriptions import (
     create_group_change_subscription,
     delete_subscription,
@@ -104,11 +104,16 @@ def main() -> int:
 
     if args.command == "provision":
         config = load_config()
+        identity = resolve_user_identity(args.upn)
+        if identity is None:
+            print(f"Warning: {args.upn} not found in Graph — computer name will fall back to the UPN local part.", file=sys.stderr)
         result = provision_session_host(
             upn=args.upn,
             config=config,
             vm_size=args.vm_size,
             dry_run=args.dry_run,
+            given_name=identity.given_name if identity else None,
+            surname=identity.surname if identity else None,
         )
         print(result)
         return 0
@@ -200,13 +205,19 @@ def main() -> int:
                 print(f"  deallocate_session_host result: {result}")
                 continue
 
-            upn = resolve_user_upn(change.member_id)
-            if upn is None:
+            identity = resolve_user_identity(change.member_id)
+            if identity is None:
                 print(f"[added] {change.member_id} in group {change.group_id} is not a user object, skipping")
                 continue
 
-            print(f"[added] {change.member_id} in group {change.group_id} -> {upn}")
-            result = provision_session_host(upn=upn, config=config, dry_run=not args.execute)
+            print(f"[added] {change.member_id} in group {change.group_id} -> {identity.upn}")
+            result = provision_session_host(
+                upn=identity.upn,
+                config=config,
+                dry_run=not args.execute,
+                given_name=identity.given_name,
+                surname=identity.surname,
+            )
             print(f"  provision_session_host result: {result}")
         return 0
 

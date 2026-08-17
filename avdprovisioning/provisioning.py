@@ -47,6 +47,8 @@ def provision_session_host(
     vm_size: str | None = None,
     dry_run: bool = False,
     user_key: str | None = None,
+    given_name: str | None = None,
+    surname: str | None = None,
 ) -> dict:
     """Provision and assign one session host for `upn`.
 
@@ -54,6 +56,10 @@ def provision_session_host(
     Graph object id of the group member when called from the group-change
     pipeline. Falls back to `upn` when called ad hoc (e.g. `local_cli.py
     provision --upn`, where no Graph object id is available).
+
+    `given_name`/`surname` (from Graph, when the caller has them) drive the
+    Windows computer name's surname-then-given-name truncation — see
+    naming.computer_name. Omit them to fall back to the UPN local part.
     """
     clients = build_clients(config)
     size = vm_size or config.vm_size_default
@@ -81,9 +87,9 @@ def provision_session_host(
             logger.info("User %s already has a session host assigned: %s", upn, existing.name)
             return {"status": "already_provisioned", "session_host": existing.name}
 
-    vm = naming.vm_name(upn, config.vm_name_prefix)
-    nic = naming.nic_name(upn, config.vm_name_prefix)
-    computer_name = naming.computer_name(upn)
+    vm = naming.vm_name(upn, config.vm_name_prefix, given_name, surname)
+    nic = naming.nic_name(upn, config.vm_name_prefix, given_name, surname)
+    computer_name = naming.computer_name(upn, config.vm_name_prefix, given_name, surname)
 
     # Fetched even in dry-run: a read-only ARM call, cheap insurance that
     # catches a wrong VNet/subnet/resource-group *before* any real resource
