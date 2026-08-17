@@ -15,7 +15,7 @@ Three separate pieces of compute, all in **one Python Function App**, each doing
 | # | Function | Trigger | Job |
 |---|----------|---------|-----|
 | 1 | `notification_listener` | HTTP | Validate the Graph webhook handshake, verify `clientState`, extract the added/removed member id(s) directly from the notification payload, and hand off to a queue — fast ack only, no heavy logic. |
-| 2 | `group_change_processor` | Storage Queue | Do the actual work: resolve each added member's object id to a UPN, provision a new VM + assign it. |
+| 2 | `group_change_processor` | Storage Queue | Do the actual work: for an add, resolve the member's object id to a UPN and provision+assign a new VM; for a remove, deallocate the VM already on record for that object id. |
 | 3 | `subscription_renewer` | Timer (daily) | Keep the Graph subscription alive; recreate it if it's gone. |
 
 **Confirmed by live test (2026-07-27):** a real add and a real remove against the `AVD Personal Users` group were captured (`sample-added-user-event-request-body.txt`, `sample-removed-user-event-request-body.txt`). Both show `resourceData['members@delta']` containing the changed member's object id directly on the notification itself — an add has just `{"id": ...}`, a remove has `{"id": ..., "@removed": "deleted"}`. `clientState` and `subscriptionId` on the payload matched the subscription created via `local_cli.py subscribe-group-changes` exactly, confirming the authenticity check works as designed.
@@ -32,16 +32,18 @@ Microsoft Graph change notification (POST)
         │
         ▼
 [HTTP] notification_listener  ──validate clientState──▶  Storage Queue
-        │ (202 within seconds)     one message per changed member id
-        ▼                          (skip entries carrying "@removed")
+        │ (202 within seconds)     one message per changed member id,
+        ▼                          tagged change_type: "added"/"removed"
    (Graph is done, moves on)
 
 Storage Queue
         │
         ▼
 [Queue] group_change_processor
-   1. Resolve member object id → UPN  (GET /users/{id})
-   2. provision_session_host(upn)
+   added:   1. Resolve member object id → UPN  (GET /users/{id})
+            2. provision_session_host(upn)
+   removed: 1. deallocate_session_host(member_id)  — looks up the VM
+               directly off the hostmap, no Graph call needed
 
 [Timer, daily] subscription_renewer
    1. Load subscription record from Blob state (subscription.json)
@@ -84,7 +86,7 @@ Both behaviors (claim-rejects-duplicate, update-rejects-stale-etag) were verifie
 1. **Validation handshake:** if the request has a `validationToken` query parameter, echo it back as `text/plain` with HTTP 200 within 10 seconds. This only happens at subscription creation/recreation time. (Originally proved out against the Logic App stand-in for this function; the real Function now does the same check directly.)
 2. **Real notifications:** parse the `changeNotificationCollection` body. For each notification:
    - Compare `clientState` against the secret in `subscription.json` (Blob state, loaded fresh each invocation). Discard/reject anything that doesn't match — this is your only proof the call came from your own subscription and not a forged request.
-   - Read `resourceData['members@delta']` directly off the notification. For each entry **without** an `@removed` marker, push a message (group id, member object id) onto the `group-membership-changes` Storage Queue via the function's queue output binding. Entries **with** `@removed` are a removal — out of scope for provisioning (see Section 5 note), skip.
+   - Read `resourceData['members@delta']` directly off the notification. For each entry, push a message (group id, member object id, `change_type`: `"added"` or `"removed"` depending on whether the entry carries an `@removed` marker) onto the `group-membership-changes` Storage Queue via the function's queue output binding. **Built and live-tested (2026-08-17):** removals used to be dropped here entirely; both directions now flow through the same queue (see Section 5).
 3. Return HTTP 202 immediately after queueing — don't wait on any Graph/VM calls in this function.
 
 **Open decision, still open:** a `lifecycleNotificationUrl` (for `reauthorizationRequired` events) on a separate route hasn't been added. Not required for v1 — the daily renewer (Section 6) covers the same need on a schedule.
@@ -93,11 +95,21 @@ Both behaviors (claim-rejects-duplicate, update-rejects-stale-etag) were verifie
 
 **Built and deployed (2026-07-27):** `function_app.py`, triggered on the `group-membership-changes` queue (`AzureWebJobsStorage` connection). Poison-message handling is the platform default (5 dequeue attempts, then `group-membership-changes-poison`) — no custom retry logic.
 
-**Responsibilities, per invocation (one queued member id):**
-1. Resolve the member's object id to a UPN: `GET /users/{id}?$select=userPrincipalName`. A 404 means the id isn't a user (e.g. a nested group or service principal was added to the group) — log and skip.
-2. `provision_session_host(upn, config, user_key=member_id)`
+**Responsibilities, per invocation (one queued member id), branching on `change_type`:**
+- `"added"`:
+  1. Resolve the member's object id to a UPN: `GET /users/{id}?$select=userPrincipalName`. A 404 means the id isn't a user (e.g. a nested group or service principal was added to the group) — log and skip.
+  2. `provision_session_host(upn, config, user_key=member_id)`
+- `"removed"`: `deallocate_session_host(member_id, config)` — see below.
 
-> Note: removals are filtered out already in `notification_listener` (Section 4) and never reach this queue. Silently discarding them is fine functionally, but you lose a natural signal for "this person left the group" if you ever want it later — logging them at that stage instead of dropping them entirely is worth considering.
+**Built and live-tested (2026-08-17):** removals used to be filtered out in `notification_listener` (Section 4) and never reached this queue, silently discarding a real signal ("this person left the group"). They now flow through and trigger `deallocate_session_host`.
+
+### `deallocate_session_host(user_key)` steps
+1. Look up `StateStore.get_hostmap_entry(user_key)` directly — no Graph call needed, since the queued `member_id` is already the hostmap key.
+2. If no entry, or the entry's `state` isn't `"assigned"` (e.g. already `"deallocated"` from a prior/duplicate removal, or still `"provisioning"`), skip — this is what makes the function idempotent against duplicate/replayed removal notifications.
+3. `ComputeManagementClient.virtual_machines.begin_deallocate(resource_group, vm_name)` — stops the VM and releases compute billing; the VM/NIC/disk and the host pool's session-host registration are left in place (deallocate, not delete). The host pool's `assigned_user` on the session host is deliberately left untouched.
+4. `StateStore.update_hostmap_entry(user_key, {...state: "deallocated", deallocatedUtc...}, etag=...)`.
+
+**Known gap, deliberately out of scope:** once a hostmap entry is `"deallocated"`, `claim_hostmap_entry`'s `overwrite=False` guard only checks "does a blob exist," not its state — if this user is re-added to the group later, `provision_session_host` will hit `AlreadyClaimedError` and silently no-op (`"already_claimed"`) instead of reallocating the existing VM. Fixing that (teaching `provision_session_host` to recognize and reallocate a `"deallocated"` entry) is its own follow-up, not covered here.
 
 ### `provision_session_host(user)` steps — **now wired to `StateStore` (2026-07-27), closing the previously-flagged gap**
 1. **Idempotency check:** `StateStore.get_hostmap_entry(user_key)` — if a row exists in `provisioning`/`assigned` state, skip. `user_key` is the Graph object id when called from the queue processor (falls back to the UPN when called ad hoc via `local_cli.py provision --upn`, which has no Graph object id).

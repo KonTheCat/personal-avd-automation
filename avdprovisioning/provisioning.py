@@ -247,6 +247,55 @@ def provision_session_host(
     }
 
 
+def deallocate_session_host(user_key: str, config: Config, dry_run: bool = False) -> dict:
+    """Deallocate the VM assigned to `user_key` (the Graph object id of a group
+    member who was just removed). Requires AVD_STATE_STORAGE_ACCOUNT_URL — unlike
+    provisioning, there is no live-query fallback: the notification only carries
+    the object id, and resolving that to a VM without the hostmap would mean
+    resolving a UPN via Graph anyway, defeating the point.
+
+    KNOWN GAP: leaves the hostmap entry in state="deallocated". If this user is
+    later re-added to the group, provision_session_host's claim step
+    (state.py's claim_hostmap_entry, overwrite=False) will 409 on the
+    already-existing blob and silently no-op (AlreadyClaimedError ->
+    "already_claimed") instead of reallocating the existing VM. Reallocate-on-
+    re-add is intentionally not handled here — deliberately deferred, not an
+    oversight.
+    """
+    state_store = _build_state_store(config)
+    if state_store is None:
+        logger.warning(
+            "AVD_STATE_STORAGE_ACCOUNT_URL not set — cannot look up which VM belongs "
+            "to %s, skipping deallocate", user_key,
+        )
+        return {"status": "skipped_no_state_store"}
+
+    entry = state_store.get_hostmap_entry(user_key)
+    if entry is None:
+        logger.info("No hostmap entry for %s — nothing to deallocate", user_key)
+        return {"status": "nothing_to_deallocate"}
+    if entry.data.get("state") != "assigned":
+        logger.info("Hostmap entry for %s is in state=%s, not deallocating", user_key, entry.data.get("state"))
+        return {"status": f"skipped_state_{entry.data.get('state')}"}
+
+    vm_name = entry.data["vmName"]
+    if dry_run:
+        logger.info("[dry-run] Would deallocate VM %s for %s", vm_name, user_key)
+        return {"status": "dry_run", "vm_name": vm_name}
+
+    clients = build_clients(config)
+    logger.info("Deallocating VM %s for removed user %s", vm_name, user_key)
+    clients.compute.virtual_machines.begin_deallocate(config.resource_group, vm_name).result()
+
+    updated = dict(entry.data)
+    updated["state"] = "deallocated"
+    updated["deallocatedUtc"] = _utcnow_iso()
+    state_store.update_hostmap_entry(user_key, updated, etag=entry.etag)
+
+    logger.info("Done. %s deallocated for %s", vm_name, user_key)
+    return {"status": "deallocated", "vm_name": vm_name}
+
+
 def _build_state_store(config: Config) -> StateStore | None:
     if not config.state_storage_account_url:
         return None

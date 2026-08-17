@@ -11,7 +11,7 @@ import azure.functions as func
 
 from avdprovisioning.config import load_config
 from avdprovisioning.graph_notifications import extract_member_changes, resolve_user_upn
-from avdprovisioning.provisioning import provision_session_host
+from avdprovisioning.provisioning import deallocate_session_host, provision_session_host
 from avdprovisioning.state import StateStore
 from avdprovisioning.subscriptions import renew_or_recreate_subscription
 
@@ -51,16 +51,18 @@ def notification_listener(req: func.HttpRequest, queue_messages: func.Out[str]) 
 
     changes = extract_member_changes(body, expected_client_state=expected_client_state)
 
-    messages = []
-    for change in changes:
-        if change.removed:
-            logger.info("Member %s removed from group %s (out of scope, skipping)", change.member_id, change.group_id)
-            continue
-        messages.append(json.dumps({"group_id": change.group_id, "member_id": change.member_id}))
+    messages = [
+        json.dumps({
+            "group_id": change.group_id,
+            "member_id": change.member_id,
+            "change_type": "removed" if change.removed else "added",
+        })
+        for change in changes
+    ]
 
     if messages:
         queue_messages.set(messages)
-        logger.info("Queued %d member-added change(s)", len(messages))
+        logger.info("Queued %d member change(s)", len(messages))
 
     return func.HttpResponse(status_code=202)
 
@@ -70,13 +72,19 @@ def notification_listener(req: func.HttpRequest, queue_messages: func.Out[str]) 
 def group_change_processor(msg: func.QueueMessage) -> None:
     payload = json.loads(msg.get_body().decode("utf-8"))
     member_id = payload["member_id"]
+    change_type = payload.get("change_type", "added")
+    config = load_config()
+
+    if change_type == "removed":
+        result = deallocate_session_host(user_key=member_id, config=config)
+        logger.info("deallocate_session_host(%s) -> %s", member_id, result)
+        return
 
     upn = resolve_user_upn(member_id)
     if upn is None:
         logger.info("Member %s is not a user object, skipping", member_id)
         return
 
-    config = load_config()
     result = provision_session_host(upn=upn, config=config, user_key=member_id)
     logger.info("provision_session_host(%s) -> %s", upn, result)
 

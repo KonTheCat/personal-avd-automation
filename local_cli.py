@@ -31,7 +31,7 @@ from avdprovisioning.graph_subscriptions import (
     list_subscriptions,
     resolve_group_id,
 )
-from avdprovisioning.provisioning import provision_session_host
+from avdprovisioning.provisioning import deallocate_session_host, provision_session_host
 from avdprovisioning.state import StateStore
 
 
@@ -195,7 +195,9 @@ def main() -> int:
         config = load_config()
         for change in changes:
             if change.removed:
-                print(f"[removed] {change.member_id} left group {change.group_id} (out of scope, skipping)")
+                print(f"[removed] {change.member_id} left group {change.group_id}")
+                result = deallocate_session_host(user_key=change.member_id, config=config, dry_run=not args.execute)
+                print(f"  deallocate_session_host result: {result}")
                 continue
 
             upn = resolve_user_upn(change.member_id)
